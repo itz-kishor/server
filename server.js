@@ -13,7 +13,7 @@ const { getDocument } = require('pdfjs-dist/legacy/build/pdf.js');
 const { createCanvas } = require('canvas');
 
 // --- Firebase Initialization ---
-const serviceAccount = require('./etc/secrets/serviceAccountKey.json');
+const serviceAccount = require('/etc/secrets/serviceAccountKey.json');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   storageBucket: 'ilets-b4b42.appspot.com' // Make sure this matches your bucket name
