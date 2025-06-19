@@ -3,8 +3,8 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const path = require('path');
-const fs = require('fs');
-const cors = require('cors'); // You already have this
+const fs = require('fs'); // Still needed for serviceAccountKey.json
+const cors = require('cors');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
@@ -16,7 +16,7 @@ const { createCanvas } = require('canvas');
 const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  storageBucket: 'ilets-b4b42.appspot.com'
+  storageBucket: 'ilets-b4b42.appspot.com' // Make sure this matches your bucket name
 });
 const db = admin.firestore();
 const bucket = admin.storage().bucket();
@@ -24,62 +24,45 @@ const bucket = admin.storage().bucket();
 const app = express();
 
 // =========================================================================
-// --- MODIFICATION: DETAILED CORS CONFIGURATION ---
+// --- DETAILED CORS CONFIGURATION ---
 // =========================================================================
-
-// Define the list of allowed origins (frontends).
-// It's best practice to use an environment variable for your production URL.
 const allowedOrigins = [
   'https://anantainfotech.com', // Your production frontend
-  'http://localhost:3000',      // Your local development frontend (adjust port if needed)
-  'http://localhost:3001'       // Add any other local ports you use
+  'http://localhost:3000',      // Your local development frontend
+  'http://localhost:3001'       // Add any other ports you use
 ];
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    // If the origin is in our whitelist, allow it.
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      // Otherwise, block it.
       callback(new Error('Not allowed by CORS'));
     }
   },
-  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'], // Explicitly allow DELETE and the preflight OPTIONS
-  allowedHeaders: ['Content-Type', 'Authorization'], // Allow common headers
+  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 };
 
-// Use the detailed CORS options
-app.use(cors(corsOptions));
-// This must come BEFORE your routes.
-// =========================================================================
-
-
+app.use(cors(corsOptions)); // Use the detailed CORS options
 app.use(express.json());
 
-// In-memory store for processing jobs
+// In-memory store for processing jobs. In a production environment, this should be a more robust system like Redis.
 const processingJobs = {};
 
 // Multer setup for in-memory file storage
 const storage = multer.memoryStorage();
 const upload = multer({
     storage: storage,
-    limits: { fileSize: 50 * 1024 * 1024 }
+    limits: { fileSize: 50 * 1024 * 1024 } // Optional: Set a file size limit (e.g., 50MB)
 });
 
-// ... THE REST OF YOUR CODE REMAINS EXACTLY THE SAME ...
-// No other changes are needed below this line.
 
 // =========================================================================
 // --- REUSABLE UPLOAD & PROCESSING LOGIC ---
 // =========================================================================
-
 const createUploadJob = (req, res, targetCollection, uid = null) => {
-    // ... same as before
     if (!req.file) {
         return res.status(400).json({ message: 'Missing file.' });
     }
@@ -115,7 +98,6 @@ app.post('/api/upload-team-pdf', upload.single('pdfFile'), (req, res) => {
 
 // STAGE 2: Process the file and stream live updates via SSE
 app.get('/api/process-stream/:jobId', async (req, res) => {
-    // ... same as before
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -123,7 +105,6 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
     });
 
     const sendEvent = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
     const { jobId } = req.params;
     const job = processingJobs[jobId];
 
@@ -134,27 +115,20 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
 
     const { file, targetCollection, uid, mainCategory, subcategory } = job;
     const bookId = uuidv4();
-    
+
     try {
         const sendLog = (message) => sendEvent({ type: 'log', message });
         const sendProgress = (value) => sendEvent({ type: 'progress', value });
 
-        sendLog(`Server received job for collection: ${targetCollection}.`);
-        console.log(`[${jobId}] Starting processing for bookId: ${bookId}`);
-
         sendLog('Uploading original PDF to storage...');
         const pdfPathInStorage = `source-pdfs/${bookId}/${file.originalname}`;
-        const pdfFileInStorage = bucket.file(pdfPathInStorage);
-        await pdfFileInStorage.save(file.buffer, {
-            metadata: { contentType: file.mimetype }
-        });
+        await bucket.file(pdfPathInStorage).save(file.buffer, { metadata: { contentType: file.mimetype }});
         sendLog('Original PDF uploaded.');
 
         sendLog('Converting PDF to images...');
         const data = new Uint8Array(file.buffer);
         const pdfDocument = await getDocument(data).promise;
         const numPages = pdfDocument.numPages;
-        
         const uploadedUrls = [];
         const processedImagesPath = `processed-images/${bookId}/`;
 
@@ -163,45 +137,29 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
             const viewport = page.getViewport({ scale: 1.5 });
             const canvas = createCanvas(viewport.width, viewport.height);
             const context = canvas.getContext('2d');
-            
-            await page.render({ canvasContext: context, viewport: viewport }).promise;
-
+            await page.render({ canvasContext: context, viewport }).promise;
             const imageBuffer = canvas.toBuffer('image/jpeg');
             const imageFileName = `page-${i}.jpg`;
             const destination = `${processedImagesPath}${imageFileName}`;
-            
-            await bucket.file(destination).save(imageBuffer, { metadata: { contentType: 'image/jpeg' }});
-
+            await bucket.file(destination).save(imageBuffer, { metadata: { contentType: 'image/jpeg' } });
             const [url] = await bucket.file(destination).getSignedUrl({ action: 'read', expires: '03-09-2491' });
             uploadedUrls.push(url);
-            
             sendProgress(Math.round((i / numPages) * 100));
         }
         sendLog('All pages converted and uploaded.');
 
         sendLog(`Saving flipbook metadata to '${targetCollection}'...`);
         const thumbnailUrl = uploadedUrls.length > 0 ? uploadedUrls[0] : null;
-        
         const bookData = {
-            mainCategory: mainCategory,
-            subcategory: subcategory,
-            pdfName: file.originalname,
-            pdfPathInStorage: pdfPathInStorage,
-            imageFolderPath: processedImagesPath,
-            pageImageUrls: uploadedUrls,
-            thumbnailUrl: thumbnailUrl,
+            mainCategory: mainCategory, subcategory: subcategory, pdfName: file.originalname,
+            pdfPathInStorage: pdfPathInStorage, imageFolderPath: processedImagesPath,
+            pageImageUrls: uploadedUrls, thumbnailUrl: thumbnailUrl,
             timestamp: admin.firestore.FieldValue.serverTimestamp(),
         };
-
-        if (uid) {
-            bookData.uid = uid;
-        }
-
+        if (uid) { bookData.uid = uid; }
         await db.collection(targetCollection).doc(bookId).set(bookData);
         sendLog('Metadata saved.');
-        
         sendEvent({ type: 'done', message: 'Flipbook processed successfully!' });
-
     } catch (error) {
         console.error(`[Processing Error for jobId: ${jobId}]`, error);
         sendEvent({ type: 'error', message: error.message || 'An unknown server error occurred.' });
@@ -212,13 +170,87 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
     }
 });
 
+// =========================================================================
+// --- NEW: UPDATE ENDPOINT FOR TEAM PDFS ---
+// This route is required for the "Update PDF" button in the frontend.
+// =========================================================================
+app.post('/api/update-team-pdf/:bookId', upload.single('pdfFile'), async (req, res) => {
+    const { bookId } = req.params;
+    const { uid } = req.body;
+    const newFile = req.file;
+
+    if (!bookId || !uid || !newFile) {
+        return res.status(400).json({ message: 'Missing book ID, user ID, or new file for update.' });
+    }
+
+    console.log(`[Update] Starting update for bookId: ${bookId}`);
+    try {
+        const docRef = db.collection('team-member').doc(bookId);
+        const doc = await docRef.get();
+        if (!doc.exists) {
+            return res.status(404).json({ message: 'Flipbook to update not found.' });
+        }
+        
+        // Step 1: Delete old files from Firebase Storage
+        const oldData = doc.data();
+        console.log(`[Update] Deleting old files: ${oldData.imageFolderPath} and ${oldData.pdfPathInStorage}`);
+        if (oldData.imageFolderPath) {
+            await bucket.deleteFiles({ prefix: oldData.imageFolderPath });
+        }
+        if (oldData.pdfPathInStorage) {
+            await bucket.file(oldData.pdfPathInStorage).delete().catch(err => console.error("Old PDF not found, continuing...", err.message));
+        }
+
+        // Step 2: Process and upload the NEW file
+        console.log(`[Update] Processing new file: ${newFile.originalname}`);
+        const pdfPathInStorage = `source-pdfs/${bookId}/${newFile.originalname}`;
+        await bucket.file(pdfPathInStorage).save(newFile.buffer, { metadata: { contentType: newFile.mimetype } });
+
+        const data = new Uint8Array(newFile.buffer);
+        const pdfDocument = await getDocument(data).promise;
+        const numPages = pdfDocument.numPages;
+        const uploadedUrls = [];
+        const processedImagesPath = `processed-images/${bookId}/`;
+
+        for (let i = 1; i <= numPages; i++) {
+            const page = await pdfDocument.getPage(i);
+            const viewport = page.getViewport({ scale: 1.5 });
+            const canvas = createCanvas(viewport.width, viewport.height);
+            const context = canvas.getContext('2d');
+            await page.render({ canvasContext: context, viewport }).promise;
+            const imageBuffer = canvas.toBuffer('image/jpeg');
+            const imageFileName = `page-${i}.jpg`;
+            const destination = `${processedImagesPath}${imageFileName}`;
+            await bucket.file(destination).save(imageBuffer, { metadata: { contentType: 'image/jpeg' } });
+            const [url] = await bucket.file(destination).getSignedUrl({ action: 'read', expires: '03-09-2491' });
+            uploadedUrls.push(url);
+        }
+        
+        // Step 3: Update the Firestore document with new metadata
+        const thumbnailUrl = uploadedUrls.length > 0 ? uploadedUrls[0] : null;
+        const bookUpdateData = {
+            pdfName: newFile.originalname,
+            pdfPathInStorage: pdfPathInStorage,
+            imageFolderPath: processedImagesPath,
+            pageImageUrls: uploadedUrls,
+            thumbnailUrl: thumbnailUrl,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(), // Update the timestamp
+        };
+
+        await docRef.update(bookUpdateData);
+        console.log(`[Update] Successfully updated bookId: ${bookId}`);
+        res.status(200).json({ message: 'Flipbook updated successfully!' });
+    } catch (error) {
+        console.error(`[Update Error for bookId: ${bookId}]`, error);
+        res.status(500).json({ message: 'Server error during update process.' });
+    }
+});
+
 
 // =========================================================================
 // --- DELETE & APPROVAL ENDPOINTS ---
 // =========================================================================
-
 app.delete('/api/delete-flipbook', async (req, res) => {
-    // ... same as before
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
 
@@ -239,8 +271,8 @@ app.delete('/api/delete-flipbook', async (req, res) => {
     }
 });
 
+// This is the route your frontend is now correctly calling.
 app.delete('/api/delete-team-flipbook', async (req, res) => {
-    // ... same as before
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
 
@@ -262,7 +294,6 @@ app.delete('/api/delete-team-flipbook', async (req, res) => {
 });
 
 app.post('/api/approve-flipbook', async (req, res) => {
-    // ... same as before
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
 
@@ -275,22 +306,17 @@ app.post('/api/approve-flipbook', async (req, res) => {
             if (!teamDoc.exists) {
                 throw new Error('Pending flipbook does not exist. It may have been deleted.');
             }
-            
             const bookData = teamDoc.data();
-            
             transaction.set(publicDocRef, bookData);
             transaction.delete(teamDocRef);
         });
-
         console.log(`[Approval] Book ${bookId} approved and moved to public collection.`);
         res.status(200).json({ message: 'Flipbook approved and published successfully!' });
-
     } catch (error) {
         console.error(`[Approval Error for bookId: ${bookId}]`, error);
         res.status(500).json({ message: error.message || 'Server error during approval process.' });
     }
 });
-
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
