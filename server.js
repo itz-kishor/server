@@ -3,7 +3,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const path = require('path');
-const fs = require('fs'); // Still needed for serviceAccountKey.json
+const fs = require('fs');
 const cors = require('cors');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
@@ -16,7 +16,7 @@ const { createCanvas } = require('canvas');
 const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  storageBucket: 'ilets-b4b42.appspot.com' // Make sure this matches your bucket name
+  storageBucket: 'ilets-b4b42.appspot.com'
 });
 const db = admin.firestore();
 const bucket = admin.storage().bucket();
@@ -24,40 +24,51 @@ const bucket = admin.storage().bucket();
 const app = express();
 
 // =========================================================================
-// --- DETAILED CORS CONFIGURATION ---
+// --- ‼️ CRITICAL: DETAILED CORS CONFIGURATION ‼️ ---
+// This entire block MUST be here, at the top, to solve the error.
 // =========================================================================
 const allowedOrigins = [
   'https://anantainfotech.com', // Your production frontend
   'http://localhost:3000',      // Your local development frontend
-  'http://localhost:3001'       // Add any other ports you use
+  'http://localhost:3001'       // Any other ports you use
 ];
 
 const corsOptions = {
   origin: function (origin, callback) {
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // If the origin is in our whitelist, allow it.
+    if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      // Otherwise, block it.
+      callback(new Error('This origin is not allowed by CORS.'));
     }
   },
-  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'],
+  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'], // Explicitly allow DELETE and the preflight OPTIONS
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 };
 
-app.use(cors(corsOptions)); // Use the detailed CORS options
+// This middleware must be used BEFORE any of your routes are defined.
+app.use(cors(corsOptions));
+// =========================================================================
+
+// This middleware is for parsing JSON bodies in requests.
 app.use(express.json());
 
-// In-memory store for processing jobs. In a production environment, this should be a more robust system like Redis.
+// In-memory store for processing jobs.
 const processingJobs = {};
 
 // Multer setup for in-memory file storage
 const storage = multer.memoryStorage();
 const upload = multer({
     storage: storage,
-    limits: { fileSize: 50 * 1024 * 1024 } // Optional: Set a file size limit (e.g., 50MB)
+    limits: { fileSize: 50 * 1024 * 1024 }
 });
 
+// ... The rest of the code is the same ...
 
 // =========================================================================
 // --- REUSABLE UPLOAD & PROCESSING LOGIC ---
@@ -170,10 +181,7 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
     }
 });
 
-// =========================================================================
-// --- NEW: UPDATE ENDPOINT FOR TEAM PDFS ---
-// This route is required for the "Update PDF" button in the frontend.
-// =========================================================================
+// UPDATE ENDPOINT FOR TEAM PDFS
 app.post('/api/update-team-pdf/:bookId', upload.single('pdfFile'), async (req, res) => {
     const { bookId } = req.params;
     const { uid } = req.body;
@@ -191,9 +199,7 @@ app.post('/api/update-team-pdf/:bookId', upload.single('pdfFile'), async (req, r
             return res.status(404).json({ message: 'Flipbook to update not found.' });
         }
         
-        // Step 1: Delete old files from Firebase Storage
         const oldData = doc.data();
-        console.log(`[Update] Deleting old files: ${oldData.imageFolderPath} and ${oldData.pdfPathInStorage}`);
         if (oldData.imageFolderPath) {
             await bucket.deleteFiles({ prefix: oldData.imageFolderPath });
         }
@@ -201,8 +207,6 @@ app.post('/api/update-team-pdf/:bookId', upload.single('pdfFile'), async (req, r
             await bucket.file(oldData.pdfPathInStorage).delete().catch(err => console.error("Old PDF not found, continuing...", err.message));
         }
 
-        // Step 2: Process and upload the NEW file
-        console.log(`[Update] Processing new file: ${newFile.originalname}`);
         const pdfPathInStorage = `source-pdfs/${bookId}/${newFile.originalname}`;
         await bucket.file(pdfPathInStorage).save(newFile.buffer, { metadata: { contentType: newFile.mimetype } });
 
@@ -226,7 +230,6 @@ app.post('/api/update-team-pdf/:bookId', upload.single('pdfFile'), async (req, r
             uploadedUrls.push(url);
         }
         
-        // Step 3: Update the Firestore document with new metadata
         const thumbnailUrl = uploadedUrls.length > 0 ? uploadedUrls[0] : null;
         const bookUpdateData = {
             pdfName: newFile.originalname,
@@ -234,7 +237,7 @@ app.post('/api/update-team-pdf/:bookId', upload.single('pdfFile'), async (req, r
             imageFolderPath: processedImagesPath,
             pageImageUrls: uploadedUrls,
             thumbnailUrl: thumbnailUrl,
-            timestamp: admin.firestore.FieldValue.serverTimestamp(), // Update the timestamp
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
         };
 
         await docRef.update(bookUpdateData);
@@ -253,7 +256,6 @@ app.post('/api/update-team-pdf/:bookId', upload.single('pdfFile'), async (req, r
 app.delete('/api/delete-flipbook', async (req, res) => {
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
-
     try {
         const docRef = db.collection('flipbooks').doc(bookId);
         const doc = await docRef.get();
@@ -266,16 +268,13 @@ app.delete('/api/delete-flipbook', async (req, res) => {
         await docRef.delete();
         res.status(200).json({ message: 'Public flipbook deleted successfully.' });
     } catch (error) {
-        console.error(`[Delete Error for bookId: ${bookId}]`, error);
         res.status(500).json({ message: 'Server error while deleting flipbook.' });
     }
 });
 
-// This is the route your frontend is now correctly calling.
 app.delete('/api/delete-team-flipbook', async (req, res) => {
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
-
     try {
         const docRef = db.collection('team-member').doc(bookId);
         const doc = await docRef.get();
@@ -288,7 +287,6 @@ app.delete('/api/delete-team-flipbook', async (req, res) => {
         await docRef.delete();
         res.status(200).json({ message: 'Pending flipbook deleted successfully.' });
     } catch (error) {
-        console.error(`[Team Delete Error for bookId: ${bookId}]`, error);
         res.status(500).json({ message: 'Server error while deleting pending flipbook.' });
     }
 });
@@ -296,24 +294,20 @@ app.delete('/api/delete-team-flipbook', async (req, res) => {
 app.post('/api/approve-flipbook', async (req, res) => {
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
-
     const teamDocRef = db.collection('team-member').doc(bookId);
     const publicDocRef = db.collection('flipbooks').doc(bookId);
-
     try {
         await db.runTransaction(async (transaction) => {
             const teamDoc = await transaction.get(teamDocRef);
             if (!teamDoc.exists) {
-                throw new Error('Pending flipbook does not exist. It may have been deleted.');
+                throw new Error('Pending flipbook does not exist.');
             }
             const bookData = teamDoc.data();
             transaction.set(publicDocRef, bookData);
             transaction.delete(teamDocRef);
         });
-        console.log(`[Approval] Book ${bookId} approved and moved to public collection.`);
         res.status(200).json({ message: 'Flipbook approved and published successfully!' });
     } catch (error) {
-        console.error(`[Approval Error for bookId: ${bookId}]`, error);
         res.status(500).json({ message: error.message || 'Server error during approval process.' });
     }
 });
