@@ -3,8 +3,8 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const path = require('path');
-const fs = require('fs'); // Still needed for serviceAccountKey.json, but not for temp files
-const cors = require('cors');
+const fs = require('fs');
+const cors = require('cors'); // You already have this
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
@@ -13,41 +13,73 @@ const { getDocument } = require('pdfjs-dist/legacy/build/pdf.js');
 const { createCanvas } = require('canvas');
 
 // --- Firebase Initialization ---
-const serviceAccount = require('/etc/secrets/serviceAccountKey.json');
+const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  storageBucket: 'ilets-b4b42.appspot.com' // Make sure this matches your bucket name
+  storageBucket: 'ilets-b4b42.appspot.com'
 });
 const db = admin.firestore();
 const bucket = admin.storage().bucket();
 
 const app = express();
-app.use(cors());
+
+// =========================================================================
+// --- MODIFICATION: DETAILED CORS CONFIGURATION ---
+// =========================================================================
+
+// Define the list of allowed origins (frontends).
+// It's best practice to use an environment variable for your production URL.
+const allowedOrigins = [
+  'https://anantainfotech.com', // Your production frontend
+  'http://localhost:3000',      // Your local development frontend (adjust port if needed)
+  'http://localhost:3001'       // Add any other local ports you use
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // If the origin is in our whitelist, allow it.
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      // Otherwise, block it.
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'], // Explicitly allow DELETE and the preflight OPTIONS
+  allowedHeaders: ['Content-Type', 'Authorization'], // Allow common headers
+  credentials: true
+};
+
+// Use the detailed CORS options
+app.use(cors(corsOptions));
+// This must come BEFORE your routes.
+// =========================================================================
+
+
 app.use(express.json());
 
-// In-memory store for processing jobs. In a production environment, this should be a more robust system like Redis.
+// In-memory store for processing jobs
 const processingJobs = {};
 
-
-// --- MODIFIED: Multer setup for in-memory file storage ---
-// This change prevents multer from creating an 'uploads/' folder.
-// The uploaded file will be stored in RAM as a Buffer object.
+// Multer setup for in-memory file storage
 const storage = multer.memoryStorage();
 const upload = multer({
     storage: storage,
-    limits: { fileSize: 50 * 1024 * 1024 } // Optional: Set a file size limit (e.g., 50MB) to prevent memory overload
+    limits: { fileSize: 50 * 1024 * 1024 }
 });
 
+// ... THE REST OF YOUR CODE REMAINS EXACTLY THE SAME ...
+// No other changes are needed below this line.
 
 // =========================================================================
 // --- REUSABLE UPLOAD & PROCESSING LOGIC ---
 // =========================================================================
 
-/**
- * Creates a processing job for a given file and category details.
- * This function is unchanged as it just passes the req.file object along.
- */
 const createUploadJob = (req, res, targetCollection, uid = null) => {
+    // ... same as before
     if (!req.file) {
         return res.status(400).json({ message: 'Missing file.' });
     }
@@ -57,7 +89,7 @@ const createUploadJob = (req, res, targetCollection, uid = null) => {
 
     const jobId = uuidv4();
     processingJobs[jobId] = {
-        file: req.file, // req.file now contains a .buffer property instead of .path
+        file: req.file,
         targetCollection: targetCollection,
         uid: uid,
         mainCategory: req.body.mainCategory,
@@ -83,6 +115,7 @@ app.post('/api/upload-team-pdf', upload.single('pdfFile'), (req, res) => {
 
 // STAGE 2: Process the file and stream live updates via SSE
 app.get('/api/process-stream/:jobId', async (req, res) => {
+    // ... same as before
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -101,9 +134,7 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
 
     const { file, targetCollection, uid, mainCategory, subcategory } = job;
     const bookId = uuidv4();
-    // --- REMOVED --- No longer need a path to a temporary file on disk.
-    // const tempPdfPath = file.path;
-
+    
     try {
         const sendLog = (message) => sendEvent({ type: 'log', message });
         const sendProgress = (value) => sendEvent({ type: 'progress', value });
@@ -111,24 +142,19 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
         sendLog(`Server received job for collection: ${targetCollection}.`);
         console.log(`[${jobId}] Starting processing for bookId: ${bookId}`);
 
-        // --- MODIFIED: Step 1 - Upload original PDF from memory buffer ---
         sendLog('Uploading original PDF to storage...');
         const pdfPathInStorage = `source-pdfs/${bookId}/${file.originalname}`;
-        // We use .save() with the buffer instead of .upload() with a file path.
         const pdfFileInStorage = bucket.file(pdfPathInStorage);
         await pdfFileInStorage.save(file.buffer, {
-            metadata: { contentType: file.mimetype } // It's good practice to set the content type
+            metadata: { contentType: file.mimetype }
         });
         sendLog('Original PDF uploaded.');
 
-        // --- MODIFIED: Step 2 - Convert PDF from memory buffer ---
         sendLog('Converting PDF to images...');
-        // We no longer need to read the file from disk with fs.readFileSync.
-        // The file's data is already available in file.buffer.
         const data = new Uint8Array(file.buffer);
         const pdfDocument = await getDocument(data).promise;
         const numPages = pdfDocument.numPages;
-
+        
         const uploadedUrls = [];
         const processedImagesPath = `processed-images/${bookId}/`;
 
@@ -137,26 +163,25 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
             const viewport = page.getViewport({ scale: 1.5 });
             const canvas = createCanvas(viewport.width, viewport.height);
             const context = canvas.getContext('2d');
-
+            
             await page.render({ canvasContext: context, viewport: viewport }).promise;
 
             const imageBuffer = canvas.toBuffer('image/jpeg');
             const imageFileName = `page-${i}.jpg`;
             const destination = `${processedImagesPath}${imageFileName}`;
-
+            
             await bucket.file(destination).save(imageBuffer, { metadata: { contentType: 'image/jpeg' }});
 
             const [url] = await bucket.file(destination).getSignedUrl({ action: 'read', expires: '03-09-2491' });
             uploadedUrls.push(url);
-
+            
             sendProgress(Math.round((i / numPages) * 100));
         }
         sendLog('All pages converted and uploaded.');
 
-        // Step 3: Save metadata to the correct Firestore collection (this part is unchanged)
         sendLog(`Saving flipbook metadata to '${targetCollection}'...`);
         const thumbnailUrl = uploadedUrls.length > 0 ? uploadedUrls[0] : null;
-
+        
         const bookData = {
             mainCategory: mainCategory,
             subcategory: subcategory,
@@ -174,28 +199,26 @@ app.get('/api/process-stream/:jobId', async (req, res) => {
 
         await db.collection(targetCollection).doc(bookId).set(bookData);
         sendLog('Metadata saved.');
-
+        
         sendEvent({ type: 'done', message: 'Flipbook processed successfully!' });
 
     } catch (error) {
         console.error(`[Processing Error for jobId: ${jobId}]`, error);
         sendEvent({ type: 'error', message: error.message || 'An unknown server error occurred.' });
     } finally {
-        // --- REMOVED: No need to delete a temporary file that was never created.
-        // if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath);
         delete processingJobs[jobId];
         console.log(`[${jobId}] Process finished. Cleaning up.`);
-        res.end(); // Close the SSE connection
+        res.end();
     }
 });
 
 
 // =========================================================================
-// --- DELETE & APPROVAL ENDPOINTS (No changes needed here) ---
+// --- DELETE & APPROVAL ENDPOINTS ---
 // =========================================================================
-// ... (The delete and approve endpoints remain exactly the same) ...
 
 app.delete('/api/delete-flipbook', async (req, res) => {
+    // ... same as before
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
 
@@ -203,11 +226,11 @@ app.delete('/api/delete-flipbook', async (req, res) => {
         const docRef = db.collection('flipbooks').doc(bookId);
         const doc = await docRef.get();
         if (!doc.exists) return res.status(404).json({ message: 'Flipbook not found.' });
-
+        
         const data = doc.data();
         if (data.imageFolderPath) await bucket.deleteFiles({ prefix: data.imageFolderPath });
         if (data.pdfPathInStorage) await bucket.file(data.pdfPathInStorage).delete().catch(() => {});
-
+        
         await docRef.delete();
         res.status(200).json({ message: 'Public flipbook deleted successfully.' });
     } catch (error) {
@@ -217,6 +240,7 @@ app.delete('/api/delete-flipbook', async (req, res) => {
 });
 
 app.delete('/api/delete-team-flipbook', async (req, res) => {
+    // ... same as before
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
 
@@ -238,6 +262,7 @@ app.delete('/api/delete-team-flipbook', async (req, res) => {
 });
 
 app.post('/api/approve-flipbook', async (req, res) => {
+    // ... same as before
     const { id: bookId } = req.body;
     if (!bookId) return res.status(400).json({ message: 'Flipbook ID is required.' });
 
@@ -250,9 +275,9 @@ app.post('/api/approve-flipbook', async (req, res) => {
             if (!teamDoc.exists) {
                 throw new Error('Pending flipbook does not exist. It may have been deleted.');
             }
-
+            
             const bookData = teamDoc.data();
-
+            
             transaction.set(publicDocRef, bookData);
             transaction.delete(teamDocRef);
         });
